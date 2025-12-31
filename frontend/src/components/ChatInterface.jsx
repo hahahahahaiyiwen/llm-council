@@ -1,145 +1,447 @@
-import { useState, useEffect, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
-import Stage1 from './Stage1';
-import Stage2 from './Stage2';
-import Stage3 from './Stage3';
 import './ChatInterface.css';
 
-export default function ChatInterface({
-  conversation,
-  onSendMessage,
-  isLoading,
-}) {
-  const [input, setInput] = useState('');
-  const messagesEndRef = useRef(null);
+const formatTime = (value) => {
+  if (!value) return '';
+  try {
+    return new Date(value).toLocaleString();
+  } catch (error) {
+    return '';
+  }
+};
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
+const buildMetadata = (raw) => {
+  return raw
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const [key, ...rest] = entry.split('=');
+      if (!key || rest.length === 0) {
+        return null;
+      }
+      return { key: key.trim(), value: rest.join('=').trim() };
+    })
+    .filter(Boolean);
+};
+
+export default function ChatInterface({
+  session,
+  onStartSession,
+  isRunning,
+  apiMode = 'stream',
+  onApiModeChange,
+}) {
+  const [problem, setProblem] = useState('');
+  const [context, setContext] = useState('');
+  const [numMembers, setNumMembers] = useState(3);
+  const [timeoutSeconds, setTimeoutSeconds] = useState(120);
+  const [roomType, setRoomType] = useState('original');
+  const [metadataInput, setMetadataInput] = useState('');
+  const [activeTab, setActiveTab] = useState('messages');
+  const [isTabCollapsed, setIsTabCollapsed] = useState(false);
+  const [expandedReasonEvents, setExpandedReasonEvents] = useState(() => new Set());
+
+  const eventStreamEndRef = useRef(null);
 
   useEffect(() => {
-    scrollToBottom();
-  }, [conversation]);
+    eventStreamEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [session?.events?.length, session?.deliverable, session?.status]);
 
-  const handleSubmit = (e) => {
-    e.preventDefault();
-    if (input.trim() && !isLoading) {
-      onSendMessage(input);
-      setInput('');
+  useEffect(() => {
+    if (!session) {
+      setActiveTab('messages');
+      setIsTabCollapsed(false);
+      setExpandedReasonEvents(new Set());
+      return;
+    }
+
+    if (session.status === 'running') {
+      setActiveTab('messages');
+      setIsTabCollapsed(false);
+    }
+  }, [session, session?.status]);
+
+  useEffect(() => {
+    if (session?.deliverable) {
+      setActiveTab('deliverable');
+      setIsTabCollapsed(false);
+    }
+  }, [session?.deliverable]);
+
+  useEffect(() => {
+    setExpandedReasonEvents(new Set());
+  }, [session?.id, session?.startedAt]);
+
+  const sessionMetadata = useMemo(() => session?.request?.metadata ?? [], [session]);
+  const selectedApiMode = apiMode ?? 'stream';
+
+  const handleTabClick = (tab) => {
+    if (tab === 'deliverable' && !session?.deliverable) {
+      return;
+    }
+
+    if (tab === activeTab) {
+      setIsTabCollapsed((previous) => !previous);
+    } else {
+      setActiveTab(tab);
+      setIsTabCollapsed(false);
     }
   };
 
-  const handleKeyDown = (e) => {
-    // Submit on Enter (without Shift)
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSubmit(e);
+  const handleSubmit = (event) => {
+    event.preventDefault();
+    const trimmedProblem = problem.trim();
+    if (!trimmedProblem || isRunning) {
+      return;
     }
+
+    const request = {
+      problem: trimmedProblem,
+      context: context.trim() || null,
+      metadata: buildMetadata(metadataInput),
+      num_members: Number(numMembers) || 3,
+      timeout_seconds: Number(timeoutSeconds) || 120,
+      room_type: roomType,
+    };
+
+    onStartSession(request, selectedApiMode);
+    setProblem('');
+    setContext('');
+    setMetadataInput('');
   };
 
-  if (!conversation) {
+  if (!session) {
     return (
       <div className="chat-interface">
-        <div className="empty-state">
-          <h2>Welcome to LLM Council</h2>
-          <p>Create a new conversation to get started</p>
+        <div className="session-form-wrapper">
+          <h2>Start a New Session</h2>
+          <p className="session-form-description">
+            Provide a problem statement and optional context. The council session will
+            stream live updates and a final deliverable.
+          </p>
+          <form className="session-form" onSubmit={handleSubmit}>
+            <label htmlFor="problem">Problem *</label>
+            <textarea
+              id="problem"
+              className="message-input"
+              value={problem}
+              onChange={(event) => setProblem(event.target.value)}
+              placeholder="Describe the problem for the council to solve"
+              rows={6}
+              required
+              disabled={isRunning}
+            />
+
+            <label htmlFor="context">Context</label>
+            <textarea
+              id="context"
+              className="message-input"
+              value={context}
+              onChange={(event) => setContext(event.target.value)}
+              placeholder="Optional additional context"
+              rows={4}
+              disabled={isRunning}
+            />
+
+            <div className="session-form-row">
+              <label htmlFor="num-members">Members</label>
+              <input
+                id="num-members"
+                type="number"
+                min={1}
+                max={10}
+                value={numMembers}
+                onChange={(event) => setNumMembers(event.target.value)}
+                disabled={isRunning}
+              />
+
+              <label htmlFor="timeout-seconds">Timeout (s)</label>
+              <input
+                id="timeout-seconds"
+                type="number"
+                min={30}
+                value={timeoutSeconds}
+                onChange={(event) => setTimeoutSeconds(event.target.value)}
+                disabled={isRunning}
+              />
+
+              <label htmlFor="room-type">Room</label>
+              <select
+                id="room-type"
+                value={roomType}
+                onChange={(event) => setRoomType(event.target.value)}
+                disabled={isRunning}
+              >
+                <option value="original">Original</option>
+                <option value="round_robin">Round Robin</option>
+              </select>
+            </div>
+
+            <label htmlFor="metadata">Metadata (key=value per line)</label>
+            <textarea
+              id="metadata"
+              className="message-input"
+              value={metadataInput}
+              onChange={(event) => setMetadataInput(event.target.value)}
+              placeholder="priority=high\ndeployment=staging"
+              rows={3}
+              disabled={isRunning}
+            />
+
+            <label htmlFor="api-mode">API Endpoint</label>
+            <select
+              id="api-mode"
+              value={selectedApiMode}
+              onChange={(event) => onApiModeChange?.(event.target.value)}
+              disabled={isRunning}
+            >
+              <option value="stream">Streaming (/council/run)</option>
+              <option value="async">Async polling (/council/start)</option>
+            </select>
+            <p className="session-form-hint">
+              Streaming keeps a single connection open, while async polling periodically fetches updates from the
+              operation status endpoint.
+            </p>
+
+            <button
+              type="submit"
+              className="send-button"
+              disabled={!problem.trim() || isRunning}
+            >
+              Start Session
+            </button>
+          </form>
         </div>
       </div>
     );
   }
 
+  const eventItems = session.events ?? [];
+  const isMessagesTabActive = activeTab === 'messages';
+  const isDeliverableTabActive = activeTab === 'deliverable';
+  const showTabContent = !isTabCollapsed;
+  const sessionTransport = session.transport ?? 'stream';
+  const isPollingSession = sessionTransport === 'async';
+  const runningMessage = isPollingSession
+    ? 'Polling async operation...'
+    : 'Streaming council events...';
+  const toggleReasoning = (eventKey) => {
+    setExpandedReasonEvents((previous) => {
+      const next = new Set(previous);
+      if (next.has(eventKey)) {
+        next.delete(eventKey);
+      } else {
+        next.add(eventKey);
+      }
+      return next;
+    });
+  };
+
+  const renderEventPayload = (event, eventKey) => {
+    const payload = event?.payload;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return (
+        <pre className="event-payload">
+          {JSON.stringify(payload ?? {}, null, 2)}
+        </pre>
+      );
+    }
+
+    const knownKeys = new Set(['member', 'timestamp', 'response', 'reasoning', 'message']);
+    const additionalEntries = Object.entries(payload).filter(([key]) => !knownKeys.has(key));
+    const isReasoningExpanded = expandedReasonEvents.has(eventKey);
+
+    return (
+      <div className="event-content">
+        {payload.member && (
+          <div className="event-member">
+            <span className="event-member-label">Member</span>
+            <span className="event-member-name">{payload.member}</span>
+          </div>
+        )}
+
+        {payload.response && (
+          <div className="event-section">
+            <div className="event-section-title">Response</div>
+            <div className="event-section-body">
+              <ReactMarkdown>{payload.response}</ReactMarkdown>
+            </div>
+          </div>
+        )}
+
+        {payload.reasoning && (
+          <div className="event-section reasoning">
+            <div className="event-section-header">
+              <div className="event-section-title">Reasoning</div>
+              <button
+                type="button"
+                className="event-section-toggle"
+                onClick={() => toggleReasoning(eventKey)}
+              >
+                {isReasoningExpanded ? 'Hide' : 'Show'} reasoning
+              </button>
+            </div>
+            {isReasoningExpanded && (
+              <div className="event-section-body">
+                <ReactMarkdown>{payload.reasoning}</ReactMarkdown>
+              </div>
+            )}
+          </div>
+        )}
+
+        {payload.message && (
+          <div className="event-section subtle">
+            <div className="event-section-title">Message</div>
+            <div className="event-section-body">
+              <ReactMarkdown>{payload.message}</ReactMarkdown>
+            </div>
+          </div>
+        )}
+
+        {additionalEntries.length > 0 && (
+          <div className="event-extra">
+            <div className="event-section-title">Details</div>
+            <ul>
+              {additionalEntries.map(([key, value]) => (
+                <li key={key}>
+                  <span className="metadata-key">{key}</span>: {' '}
+                  {typeof value === 'string' ? value : JSON.stringify(value)}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div className="chat-interface">
-      <div className="messages-container">
-        {conversation.messages.length === 0 ? (
-          <div className="empty-state">
-            <h2>Start a conversation</h2>
-            <p>Ask a question to consult the LLM Council</p>
+      <div className="session-overview">
+        <h2>Session Overview</h2>
+        <div className="session-meta-row">
+          <span className={`session-status status-${session.status}`}>
+            Status: {session.status}
+          </span>
+          <span>Started: {formatTime(session.startedAt)}</span>
+          {session.error && (
+            <span className="session-error">Error: {session.error}</span>
+          )}
+        </div>
+
+        <div className="session-problem-block">
+          <h3>Problem</h3>
+          <div className="markdown-content">
+            <ReactMarkdown>{session.request.problem}</ReactMarkdown>
           </div>
-        ) : (
-          conversation.messages.map((msg, index) => (
-            <div key={index} className="message-group">
-              {msg.role === 'user' ? (
-                <div className="user-message">
-                  <div className="message-label">You</div>
-                  <div className="message-content">
-                    <div className="markdown-content">
-                      <ReactMarkdown>{msg.content}</ReactMarkdown>
-                    </div>
-                  </div>
-                </div>
-              ) : (
-                <div className="assistant-message">
-                  <div className="message-label">LLM Council</div>
+        </div>
 
-                  {/* Stage 1 */}
-                  {msg.loading?.stage1 && (
-                    <div className="stage-loading">
-                      <div className="spinner"></div>
-                      <span>Running Stage 1: Collecting individual responses...</span>
-                    </div>
-                  )}
-                  {msg.stage1 && <Stage1 responses={msg.stage1} />}
+        {session.request.context && (
+          <div className="session-context-block">
+            <h3>Context</h3>
+            <div className="markdown-content">
+              <ReactMarkdown>{session.request.context}</ReactMarkdown>
+            </div>
+          </div>
+        )}
 
-                  {/* Stage 2 */}
-                  {msg.loading?.stage2 && (
-                    <div className="stage-loading">
-                      <div className="spinner"></div>
-                      <span>Running Stage 2: Peer rankings...</span>
-                    </div>
-                  )}
-                  {msg.stage2 && (
-                    <Stage2
-                      rankings={msg.stage2}
-                      labelToModel={msg.metadata?.label_to_model}
-                      aggregateRankings={msg.metadata?.aggregate_rankings}
-                    />
-                  )}
+        <div className="session-parameters">
+          <div>Room Type: {session.request.room_type}</div>
+          <div>Members: {session.request.num_members}</div>
+          <div>Timeout: {session.request.timeout_seconds}s</div>
+          <div>
+            API: {isPollingSession ? 'Async polling (/council/start)' : 'Streaming (/council/run)'}
+          </div>
+        </div>
 
-                  {/* Stage 3 */}
-                  {msg.loading?.stage3 && (
-                    <div className="stage-loading">
-                      <div className="spinner"></div>
-                      <span>Running Stage 3: Final synthesis...</span>
-                    </div>
-                  )}
-                  {msg.stage3 && <Stage3 finalResponse={msg.stage3} />}
+        {session.operationId && (
+          <div className="session-operation-id">
+            Operation ID: <span className="operation-id-value">{session.operationId}</span>
+          </div>
+        )}
+
+        {sessionMetadata.length > 0 && (
+          <div className="session-metadata">
+            <h4>Metadata</h4>
+            <ul>
+              {sessionMetadata.map((item, index) => (
+                <li key={`${item.key}-${index}`}>
+                  <span className="metadata-key">{item.key}</span>: {item.value}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+
+      <div className="session-panels">
+        <div className="session-tabs">
+          <button
+            type="button"
+            className={`session-tab ${isMessagesTabActive ? 'active' : ''} ${isMessagesTabActive && isTabCollapsed ? 'collapsed' : ''}`}
+            onClick={() => handleTabClick('messages')}
+          >
+            <span>Events</span>
+            <span className="tab-indicator">{isMessagesTabActive && isTabCollapsed ? '▸' : '▾'}</span>
+          </button>
+          <button
+            type="button"
+            className={`session-tab ${isDeliverableTabActive ? 'active' : ''} ${isDeliverableTabActive && isTabCollapsed ? 'collapsed' : ''}`}
+            onClick={() => handleTabClick('deliverable')}
+            disabled={!session.deliverable}
+          >
+            <span>Deliverable</span>
+            <span className="tab-indicator">
+              {!session.deliverable ? '⏳' : isDeliverableTabActive && isTabCollapsed ? '▸' : '▾'}
+            </span>
+          </button>
+        </div>
+
+        {showTabContent && isMessagesTabActive && (
+          <div className="tab-panel messages-panel">
+            <div className="tab-panel-header">
+              {session.status === 'running' && (
+                <div className="loading-indicator">
+                  <div className="spinner"></div>
+                  <span>{runningMessage}</span>
                 </div>
               )}
             </div>
-          ))
-        )}
-
-        {isLoading && (
-          <div className="loading-indicator">
-            <div className="spinner"></div>
-            <span>Consulting the council...</span>
+            {eventItems.length === 0 ? (
+              <div className="empty-state">
+                <h3>No events yet</h3>
+                <p>The council session is preparing responses.</p>
+              </div>
+            ) : (
+              eventItems.map((event, index) => {
+                const eventKey = `${event.type}-${event.receivedAt ?? index}`;
+                return (
+                  <div key={eventKey} className="event-item">
+                  <div className="event-header">
+                    <span className="event-type">{event.type}</span>
+                    <span className="event-timestamp">{formatTime(event.receivedAt)}</span>
+                  </div>
+                  {renderEventPayload(event, eventKey)}
+                </div>
+                );
+              })
+            )}
+            <div ref={eventStreamEndRef} />
           </div>
         )}
 
-        <div ref={messagesEndRef} />
+        {showTabContent && isDeliverableTabActive && session.deliverable && (
+          <div className="tab-panel deliverable-panel">
+            <div className="tab-panel-header">
+            </div>
+            <div className="markdown-content">
+              <ReactMarkdown>{session.deliverable}</ReactMarkdown>
+            </div>
+          </div>
+        )}
       </div>
-
-      {conversation.messages.length === 0 && (
-        <form className="input-form" onSubmit={handleSubmit}>
-          <textarea
-            className="message-input"
-            placeholder="Ask your question... (Shift+Enter for new line, Enter to send)"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={handleKeyDown}
-            disabled={isLoading}
-            rows={3}
-          />
-          <button
-            type="submit"
-            className="send-button"
-            disabled={!input.trim() || isLoading}
-          >
-            Send
-          </button>
-        </form>
-      )}
     </div>
   );
 }

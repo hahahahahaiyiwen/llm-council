@@ -1,38 +1,53 @@
-import { useState, useEffect } from 'react';
 import './Sidebar.css';
 
+const statusLabels = {
+  running: 'Running',
+  completed: 'Completed',
+  failed: 'Failed',
+};
+
+const getSessionTitle = (session) => {
+  const problem = session?.request?.problem ?? '';
+  const firstLine = problem.split('\n')[0].trim();
+  return firstLine || 'Untitled Session';
+};
+
 export default function Sidebar({
-  conversations,
-  currentConversationId,
-  onSelectConversation,
-  onNewConversation,
+  sessions,
+  currentSessionId,
+  onSelectSession,
+  onNewSession,
+  isRunning,
 }) {
   return (
     <div className="sidebar">
       <div className="sidebar-header">
         <h1>LLM Council</h1>
-        <button className="new-conversation-btn" onClick={onNewConversation}>
-          + New Conversation
+        <button
+          className="new-conversation-btn"
+          onClick={onNewSession}
+          disabled={isRunning}
+        >
+          + New Session
         </button>
       </div>
 
       <div className="conversation-list">
-        {conversations.length === 0 ? (
-          <div className="no-conversations">No conversations yet</div>
+        {sessions.length === 0 ? (
+          <div className="no-conversations">No sessions yet</div>
         ) : (
-          conversations.map((conv) => (
+          sessions.map((session) => (
             <div
-              key={conv.id}
+              key={session.id}
               className={`conversation-item ${
-                conv.id === currentConversationId ? 'active' : ''
+                session.id === currentSessionId ? 'active' : ''
               }`}
-              onClick={() => onSelectConversation(conv.id)}
+              onClick={() => onSelectSession(session.id)}
             >
-              <div className="conversation-title">
-                {conv.title || 'New Conversation'}
-              </div>
+              <div className="conversation-title">{getSessionTitle(session)}</div>
               <div className="conversation-meta">
-                {conv.message_count} messages
+                {statusLabels[session.status] || 'Unknown'} ·{' '}
+                {new Date(session.startedAt).toLocaleTimeString()}
               </div>
             </div>
           ))

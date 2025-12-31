@@ -1,198 +1,257 @@
-import { useState, useEffect } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import Sidebar from './components/Sidebar';
 import ChatInterface from './components/ChatInterface';
 import { api } from './api';
 import './App.css';
 
-function App() {
-  const [conversations, setConversations] = useState([]);
-  const [currentConversationId, setCurrentConversationId] = useState(null);
-  const [currentConversation, setCurrentConversation] = useState(null);
-  const [isLoading, setIsLoading] = useState(false);
+const POLL_INTERVAL_MS = 2000;
 
-  // Load conversations on mount
+function App() {
+  const [sessions, setSessions] = useState([]);
+  const [currentSessionId, setCurrentSessionId] = useState(null);
+  const [isRunning, setIsRunning] = useState(false);
+  const [apiMode, setApiMode] = useState('stream');
+  const pollersRef = useRef(new Map());
+
+  const currentSession = useMemo(
+    () => sessions.find((session) => session.id === currentSessionId) ?? null,
+    [sessions, currentSessionId]
+  );
+
   useEffect(() => {
-    loadConversations();
+    return () => {
+      pollersRef.current.forEach((timeoutId) => clearTimeout(timeoutId));
+      pollersRef.current.clear();
+    };
   }, []);
 
-  // Load conversation details when selected
-  useEffect(() => {
-    if (currentConversationId) {
-      loadConversation(currentConversationId);
-    }
-  }, [currentConversationId]);
-
-  const loadConversations = async () => {
-    try {
-      const convs = await api.listConversations();
-      setConversations(convs);
-    } catch (error) {
-      console.error('Failed to load conversations:', error);
-    }
+  const updateSession = (sessionId, updater) => {
+    setSessions((prev) =>
+      prev.map((session) =>
+        session.id === sessionId ? updater(session) : session
+      )
+    );
   };
 
-  const loadConversation = async (id) => {
-    try {
-      const conv = await api.getConversation(id);
-      setCurrentConversation(conv);
-    } catch (error) {
-      console.error('Failed to load conversation:', error);
+  const stopPollingOperation = (operationId) => {
+    const timeoutId = pollersRef.current.get(operationId);
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+      pollersRef.current.delete(operationId);
     }
   };
 
-  const handleNewConversation = async () => {
-    try {
-      const newConv = await api.createConversation();
-      setConversations([
-        { id: newConv.id, created_at: newConv.created_at, message_count: 0 },
-        ...conversations,
-      ]);
-      setCurrentConversationId(newConv.id);
-    } catch (error) {
-      console.error('Failed to create conversation:', error);
+  // Polls backend async operations and mirrors their state into the UI.
+  const startPollingOperation = (sessionId, operationId) => {
+    const poll = async () => {
+      try {
+        const operation = await api.getOperationStatus(operationId);
+
+        updateSession(sessionId, (session) => {
+          if (!session) {
+            return session;
+          }
+
+          const existingEvents = session.events ?? [];
+          const incomingEvents = operation.events ?? [];
+          let nextEvents = existingEvents;
+
+          if (incomingEvents.length > existingEvents.length) {
+            const appended = incomingEvents
+              .slice(existingEvents.length)
+              .map((event) => ({
+                ...event,
+                receivedAt:
+                  event.payload?.timestamp ?? new Date().toISOString(),
+              }));
+            nextEvents = [...existingEvents, ...appended];
+          } else if (incomingEvents.length < existingEvents.length) {
+            nextEvents = incomingEvents.map((event, index) => ({
+              ...event,
+              receivedAt:
+                event.payload?.timestamp ?? existingEvents[index]?.receivedAt ?? new Date().toISOString(),
+            }));
+          } else if (
+            incomingEvents.length === existingEvents.length &&
+            incomingEvents.some((event, index) => {
+              const existing = existingEvents[index];
+              return (
+                !existing ||
+                existing.type !== event.type ||
+                JSON.stringify(existing.payload) !== JSON.stringify(event.payload)
+              );
+            })
+          ) {
+            nextEvents = incomingEvents.map((event, index) => ({
+              ...event,
+              receivedAt:
+                existingEvents[index]?.receivedAt ??
+                event.payload?.timestamp ??
+                new Date().toISOString(),
+            }));
+          }
+
+          return {
+            ...session,
+            events: nextEvents,
+            deliverable: operation.deliverable ?? session.deliverable,
+            status: operation.status ?? session.status,
+            error: operation.error ?? session.error,
+            operationId,
+          };
+        });
+
+        if (operation.status === 'running') {
+          const timeoutId = setTimeout(poll, POLL_INTERVAL_MS);
+          pollersRef.current.set(operationId, timeoutId);
+        } else {
+          stopPollingOperation(operationId);
+          setIsRunning(false);
+        }
+      } catch (error) {
+        console.error('Failed to poll async operation:', error);
+        updateSession(sessionId, (session) => ({
+          ...session,
+          status: 'failed',
+          error: error?.message ?? 'Failed to poll async operation.',
+        }));
+        stopPollingOperation(operationId);
+        setIsRunning(false);
+      }
+    };
+
+    stopPollingOperation(operationId);
+    poll();
+  };
+
+  const handleStartSession = async (request, mode = 'stream') => {
+    if (!request?.problem?.trim()) {
+      return;
     }
-  };
 
-  const handleSelectConversation = (id) => {
-    setCurrentConversationId(id);
-  };
+    const sessionId = (typeof crypto !== 'undefined' && 'randomUUID' in crypto)
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
-  const handleSendMessage = async (content) => {
-    if (!currentConversationId) return;
+    const newSession = {
+      id: sessionId,
+      request,
+      startedAt: new Date().toISOString(),
+      events: [],
+      deliverable: null,
+      status: 'running',
+      error: null,
+      transport: mode,
+      operationId: null,
+    };
 
-    setIsLoading(true);
+    setSessions((prev) => [newSession, ...prev]);
+    setCurrentSessionId(sessionId);
+    setIsRunning(true);
+
+    if (mode === 'async') {
+      try {
+        const operation = await api.startAsyncSession(request);
+        if (!operation?.id) {
+          throw new Error('Async API did not return an operation id.');
+        }
+
+        updateSession(sessionId, (session) => ({
+          ...session,
+          operationId: operation.id,
+          status: operation.status ?? session.status,
+        }));
+
+        startPollingOperation(sessionId, operation.id);
+      } catch (error) {
+        console.error('Failed to start async council session:', error);
+        updateSession(sessionId, (session) => ({
+          ...session,
+          status: 'failed',
+          error: error?.message ?? 'Failed to start async session.',
+        }));
+        setIsRunning(false);
+      }
+      return;
+    }
+
     try {
-      // Optimistically add user message to UI
-      const userMessage = { role: 'user', content };
-      setCurrentConversation((prev) => ({
-        ...prev,
-        messages: [...prev.messages, userMessage],
-      }));
+      await api.runSessionStream(request, (chunk) => {
+        if (!chunk || typeof chunk !== 'object') {
+          return;
+        }
 
-      // Create a partial assistant message that will be updated progressively
-      const assistantMessage = {
-        role: 'assistant',
-        stage1: null,
-        stage2: null,
-        stage3: null,
-        metadata: null,
-        loading: {
-          stage1: false,
-          stage2: false,
-          stage3: false,
-        },
-      };
+        if (chunk.kind === 'room_event' && chunk.event) {
+          updateSession(sessionId, (session) => ({
+            ...session,
+            events: [
+              ...session.events,
+              {
+                ...chunk.event,
+                receivedAt: new Date().toISOString(),
+              },
+            ],
+          }));
+          return;
+        }
 
-      // Add the partial assistant message
-      setCurrentConversation((prev) => ({
-        ...prev,
-        messages: [...prev.messages, assistantMessage],
-      }));
+        if (chunk.kind === 'deliverable') {
+          updateSession(sessionId, (session) => ({
+            ...session,
+            deliverable: chunk.deliverable ?? null,
+            status: 'completed',
+          }));
+          return;
+        }
 
-      // Send message with streaming
-      await api.sendMessageStream(currentConversationId, content, (eventType, event) => {
-        switch (eventType) {
-          case 'stage1_start':
-            setCurrentConversation((prev) => {
-              const messages = [...prev.messages];
-              const lastMsg = messages[messages.length - 1];
-              lastMsg.loading.stage1 = true;
-              return { ...prev, messages };
-            });
-            break;
-
-          case 'stage1_complete':
-            setCurrentConversation((prev) => {
-              const messages = [...prev.messages];
-              const lastMsg = messages[messages.length - 1];
-              lastMsg.stage1 = event.data;
-              lastMsg.loading.stage1 = false;
-              return { ...prev, messages };
-            });
-            break;
-
-          case 'stage2_start':
-            setCurrentConversation((prev) => {
-              const messages = [...prev.messages];
-              const lastMsg = messages[messages.length - 1];
-              lastMsg.loading.stage2 = true;
-              return { ...prev, messages };
-            });
-            break;
-
-          case 'stage2_complete':
-            setCurrentConversation((prev) => {
-              const messages = [...prev.messages];
-              const lastMsg = messages[messages.length - 1];
-              lastMsg.stage2 = event.data;
-              lastMsg.metadata = event.metadata;
-              lastMsg.loading.stage2 = false;
-              return { ...prev, messages };
-            });
-            break;
-
-          case 'stage3_start':
-            setCurrentConversation((prev) => {
-              const messages = [...prev.messages];
-              const lastMsg = messages[messages.length - 1];
-              lastMsg.loading.stage3 = true;
-              return { ...prev, messages };
-            });
-            break;
-
-          case 'stage3_complete':
-            setCurrentConversation((prev) => {
-              const messages = [...prev.messages];
-              const lastMsg = messages[messages.length - 1];
-              lastMsg.stage3 = event.data;
-              lastMsg.loading.stage3 = false;
-              return { ...prev, messages };
-            });
-            break;
-
-          case 'title_complete':
-            // Reload conversations to get updated title
-            loadConversations();
-            break;
-
-          case 'complete':
-            // Stream complete, reload conversations list
-            loadConversations();
-            setIsLoading(false);
-            break;
-
-          case 'error':
-            console.error('Stream error:', event.message);
-            setIsLoading(false);
-            break;
-
-          default:
-            console.log('Unknown event type:', eventType);
+        if (chunk.kind === 'error') {
+          updateSession(sessionId, (session) => ({
+            ...session,
+            status: 'failed',
+            error: chunk.detail ?? 'Session failed with an unknown error.',
+          }));
         }
       });
-    } catch (error) {
-      console.error('Failed to send message:', error);
-      // Remove optimistic messages on error
-      setCurrentConversation((prev) => ({
-        ...prev,
-        messages: prev.messages.slice(0, -2),
+
+      updateSession(sessionId, (session) => ({
+        ...session,
+        status: session.status === 'running' ? 'completed' : session.status,
       }));
-      setIsLoading(false);
+    } catch (error) {
+      console.error('Failed to run council session:', error);
+      updateSession(sessionId, (session) => ({
+        ...session,
+        status: 'failed',
+        error: error?.message ?? 'Failed to run session.',
+      }));
+    } finally {
+      setIsRunning(false);
     }
+  };
+
+  const handleSelectSession = (sessionId) => {
+    setCurrentSessionId(sessionId);
+  };
+
+  const handleShowNewSessionForm = () => {
+    setCurrentSessionId(null);
   };
 
   return (
     <div className="app">
       <Sidebar
-        conversations={conversations}
-        currentConversationId={currentConversationId}
-        onSelectConversation={handleSelectConversation}
-        onNewConversation={handleNewConversation}
+        sessions={sessions}
+        currentSessionId={currentSessionId}
+        onSelectSession={handleSelectSession}
+        onNewSession={handleShowNewSessionForm}
+        isRunning={isRunning}
       />
       <ChatInterface
-        conversation={currentConversation}
-        onSendMessage={handleSendMessage}
-        isLoading={isLoading}
+        session={currentSession}
+        onStartSession={handleStartSession}
+        isRunning={isRunning}
+        apiMode={apiMode}
+        onApiModeChange={setApiMode}
       />
     </div>
   );

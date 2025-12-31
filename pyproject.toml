@@ -12,4 +12,6 @@ dependencies = [
     "pydantic>=2.9.0",
     "azure-identity>=1.25.1",
     "openai>=2.14.0",
+    "agent-framework==1.0.0b251223",
+    "prompt-template>=1.2.0",
 ]

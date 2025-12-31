@@ -2,114 +2,102 @@
  * API client for the LLM Council backend.
  */
 
-const API_BASE = 'http://localhost:8001';
+const API_BASE = 'http://localhost:8080';
 
 export const api = {
   /**
-   * List all conversations.
+   * Run a council session and stream responses from the backend.
+   * @param {object} request - The council request payload.
+   * @param {(chunk: object) => void} onChunk - Callback for each streamed JSON line.
+   * @param {AbortSignal} [signal] - Optional abort signal.
    */
-  async listConversations() {
-    const response = await fetch(`${API_BASE}/api/conversations`);
-    if (!response.ok) {
-      throw new Error('Failed to list conversations');
-    }
-    return response.json();
-  },
-
-  /**
-   * Create a new conversation.
-   */
-  async createConversation() {
-    const response = await fetch(`${API_BASE}/api/conversations`, {
+  async runSessionStream(request, onChunk, signal) {
+    const response = await fetch(`${API_BASE}/council/run`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({}),
+      body: JSON.stringify(request),
+      signal,
     });
-    if (!response.ok) {
-      throw new Error('Failed to create conversation');
-    }
-    return response.json();
-  },
 
-  /**
-   * Get a specific conversation.
-   */
-  async getConversation(conversationId) {
-    const response = await fetch(
-      `${API_BASE}/api/conversations/${conversationId}`
-    );
-    if (!response.ok) {
-      throw new Error('Failed to get conversation');
-    }
-    return response.json();
-  },
-
-  /**
-   * Send a message in a conversation.
-   */
-  async sendMessage(conversationId, content) {
-    const response = await fetch(
-      `${API_BASE}/api/conversations/${conversationId}/message`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ content }),
-      }
-    );
-    if (!response.ok) {
-      throw new Error('Failed to send message');
-    }
-    return response.json();
-  },
-
-  /**
-   * Send a message and receive streaming updates.
-   * @param {string} conversationId - The conversation ID
-   * @param {string} content - The message content
-   * @param {function} onEvent - Callback function for each event: (eventType, data) => void
-   * @returns {Promise<void>}
-   */
-  async sendMessageStream(conversationId, content, onEvent) {
-    const response = await fetch(
-      `${API_BASE}/api/conversations/${conversationId}/message/stream`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ content }),
-      }
-    );
-
-    if (!response.ok) {
-      throw new Error('Failed to send message');
+    if (!response.ok || !response.body) {
+      throw new Error('Failed to start council session');
     }
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
+    let buffer = '';
 
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) {
+        break;
+      }
 
-      const chunk = decoder.decode(value);
-      const lines = chunk.split('\n');
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
 
       for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          const data = line.slice(6);
-          try {
-            const event = JSON.parse(data);
-            onEvent(event.type, event);
-          } catch (e) {
-            console.error('Failed to parse SSE event:', e);
-          }
+        const trimmed = line.trim();
+        if (!trimmed) {
+          continue;
+        }
+
+        try {
+          const parsed = JSON.parse(trimmed);
+          onChunk(parsed);
+        } catch (error) {
+          console.error('Failed to parse streamed JSON line:', { line: trimmed, error });
         }
       }
     }
+
+    const trailing = buffer.trim();
+    if (trailing) {
+      try {
+        const parsed = JSON.parse(trailing);
+        onChunk(parsed);
+      } catch (error) {
+        console.error('Failed to parse trailing JSON line:', { line: trailing, error });
+      }
+    }
+  },
+
+  /**
+   * Start an async council session and receive an operation descriptor.
+   * @param {object} request - The council request payload.
+   * @returns {Promise<object>} - The async operation response.
+   */
+  async startAsyncSession(request) {
+    const response = await fetch(`${API_BASE}/council/start`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(request),
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to start async council session');
+    }
+
+    return response.json();
+  },
+
+  /**
+   * Fetch the latest status for an async council operation.
+   * @param {string} operationId - The async operation identifier.
+   * @returns {Promise<object>} - The operation status payload.
+   */
+  async getOperationStatus(operationId) {
+    const response = await fetch(`${API_BASE}/council/operations/${operationId}`);
+
+    if (!response.ok) {
+      throw new Error('Failed to retrieve async operation status');
+    }
+
+    return response.json();
   },
 };
